@@ -31,3 +31,17 @@ LATEST_POST_LIMIT=15
 ```
 
 Do not commit `.env`, `*.session`, `downloads/`, or logs.
+
+## GitHub Actions Free Scheduled Mode
+
+The included workflow runs every 15 minutes and executes the collector once.
+It fetches the latest posts, sends new posts to the backend, then exits.
+
+Required repository secrets:
+
+```env
+API_ID=your_telegram_api_id
+API_HASH=your_telegram_api_hash
+STRING_SESSION=your_telethon_string_session
+BACKEND_NEWS_ENDPOINT=https://fantasy-2wc5.onrender.com/api/news/telegram
+```

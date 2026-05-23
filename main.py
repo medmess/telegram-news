@@ -46,6 +46,7 @@ SESSION_NAME = os.getenv("SESSION_NAME", "fantasy_session")
 STRING_SESSION = os.getenv("STRING_SESSION", "")
 SOURCE_NAME = os.getenv("SOURCE_NAME", "Offside")
 LATEST_POST_LIMIT = int(os.getenv("LATEST_POST_LIMIT", "15"))
+RUN_ONCE = os.getenv("RUN_ONCE", "false").lower() in {"1", "true", "yes"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -241,10 +242,14 @@ async def main() -> None:
     if STRING_SESSION:
         logger.info("Using STRING_SESSION for Telegram authentication")
     await get_latest_posts()
+    if RUN_ONCE:
+        logger.info("RUN_ONCE enabled; exiting after latest-post sync")
+        return
     logger.info("Listening for new posts from @%s", CHANNEL_USERNAME)
 
 
 if __name__ == "__main__":
     with client:
         client.loop.run_until_complete(main())
-        client.run_until_disconnected()
+        if not RUN_ONCE:
+            client.run_until_disconnected()

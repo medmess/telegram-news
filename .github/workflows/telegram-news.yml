@@ -32,6 +32,8 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           STRING_SESSION: ${{ secrets.STRING_SESSION }}
           CHANNEL_USERNAME: Offsideahdaff
+          ADDITIONAL_CHANNELS: Erupean_sportt
+          CHANNEL_SOURCE_NAMES: Offsideahdaff=Offside,Erupean_sportt=European Sport
           BACKEND_NEWS_ENDPOINT: ${{ secrets.BACKEND_NEWS_ENDPOINT }}
           SOURCE_NAME: Offside
           LATEST_POST_LIMIT: "15"

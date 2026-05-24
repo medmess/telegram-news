@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import os
 import re
+import zlib
 from datetime import timezone
 from pathlib import Path
 from urllib import error, request
@@ -38,6 +39,11 @@ load_env(ENV_PATH)
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "Offsideahdaff")
+ADDITIONAL_CHANNELS = os.getenv("ADDITIONAL_CHANNELS", "Erupean_sportt")
+CHANNEL_SOURCE_NAMES = os.getenv(
+    "CHANNEL_SOURCE_NAMES",
+    "Offsideahdaff=Offside,Erupean_sportt=European Sport",
+)
 BACKEND_NEWS_ENDPOINT = os.getenv(
     "BACKEND_NEWS_ENDPOINT",
     "https://fantasy-2wc5.onrender.com/api/news/telegram",
@@ -56,7 +62,8 @@ logger = logging.getLogger("telegram-news")
 
 session = StringSession(STRING_SESSION) if STRING_SESSION else str(BASE_DIR / SESSION_NAME)
 client = TelegramClient(session, API_ID, API_HASH)
-processed_post_ids: set[int] = set()
+processed_post_ids: set[tuple[str, int]] = set()
+seen_post_fingerprints: set[str] = set()
 
 SPORT_KEYWORDS = (
     "football",
@@ -112,6 +119,43 @@ SPORT_KEYWORDS = (
 )
 
 
+def clean_channel_name(channel: str) -> str:
+    return channel.strip().lstrip("@")
+
+
+def parse_channels() -> list[str]:
+    channels = [clean_channel_name(CHANNEL_USERNAME)]
+    channels.extend(
+        clean_channel_name(channel)
+        for channel in ADDITIONAL_CHANNELS.split(",")
+        if channel.strip()
+    )
+
+    unique_channels: list[str] = []
+    for channel in channels:
+        if channel and channel not in unique_channels:
+            unique_channels.append(channel)
+    return unique_channels
+
+
+def parse_source_names() -> dict[str, str]:
+    sources: dict[str, str] = {}
+    for pair in CHANNEL_SOURCE_NAMES.split(","):
+        if "=" not in pair:
+            continue
+        channel, source = pair.split("=", 1)
+        channel = clean_channel_name(channel)
+        source = source.strip()
+        if channel and source:
+            sources[channel] = source
+    sources.setdefault(clean_channel_name(CHANNEL_USERNAME), SOURCE_NAME)
+    return sources
+
+
+CHANNEL_USERNAMES = parse_channels()
+SOURCE_BY_CHANNEL = parse_source_names()
+
+
 def validate_config() -> None:
     if API_ID <= 0:
         raise RuntimeError("API_ID is missing.")
@@ -121,6 +165,8 @@ def validate_config() -> None:
         raise RuntimeError("BACKEND_NEWS_ENDPOINT is missing.")
     if LATEST_POST_LIMIT <= 0:
         raise RuntimeError("LATEST_POST_LIMIT must be greater than 0.")
+    if not CHANNEL_USERNAMES:
+        raise RuntimeError("At least one Telegram channel is required.")
 
 
 def iso_date(message_date) -> str:
@@ -142,6 +188,14 @@ def normalize_for_matching(text: str) -> str:
     return text.lower()
 
 
+def post_fingerprint(text: str) -> str:
+    normalized = normalize_for_matching(text)
+    normalized = re.sub(r"https?://\S+", " ", normalized)
+    normalized = re.sub(r"[^\w\u0600-\u06ff]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized[:360]
+
+
 def is_sports_related(text: str) -> bool:
     lower_text = normalize_for_matching(text)
     return any(keyword in lower_text for keyword in SPORT_KEYWORDS)
@@ -157,14 +211,51 @@ def image_payload(image_path: str) -> tuple[str | None, str | None]:
     return encoded, content_type
 
 
-async def send_to_backend(message, image_path: str, caption: str) -> bool:
+def backend_post_id(channel: str, message_id: int) -> int:
+    primary_channel = clean_channel_name(CHANNEL_USERNAME)
+    if channel == primary_channel:
+        return message_id
+
+    channel_hash = zlib.crc32(channel.encode("utf-8")) % 100_000
+    return channel_hash * 10_000_000 + message_id
+
+
+def source_name(channel: str) -> str:
+    return SOURCE_BY_CHANNEL.get(channel, channel)
+
+
+def latest_news_endpoint() -> str:
+    if BACKEND_NEWS_ENDPOINT.endswith("/api/news/telegram"):
+        return BACKEND_NEWS_ENDPOINT.replace(
+            "/api/news/telegram",
+            "/api/news/latest?limit=80",
+        )
+    return BACKEND_NEWS_ENDPOINT.rstrip("/") + "/latest?limit=80"
+
+
+async def load_existing_fingerprints() -> None:
+    http_request = request.Request(latest_news_endpoint(), method="GET")
+    try:
+        response = await asyncio.to_thread(request.urlopen, http_request, timeout=20)
+        payload = json.loads(response.read().decode("utf-8"))
+        for item in payload:
+            caption = clean_caption(str(item.get("caption", "")))
+            if caption:
+                seen_post_fingerprints.add(post_fingerprint(caption))
+        logger.info("Loaded %s existing backend news fingerprints", len(seen_post_fingerprints))
+    except Exception:
+        logger.exception("Could not preload backend news fingerprints; continuing")
+
+
+async def send_to_backend(message, channel: str, image_path: str, caption: str) -> bool:
     encoded_image, content_type = image_payload(image_path)
+    post_id = backend_post_id(channel, message.id)
     payload = {
-        "telegramPostId": message.id,
+        "telegramPostId": post_id,
         "caption": caption,
         "imagePath": image_path,
         "publishedAt": iso_date(message.date),
-        "source": SOURCE_NAME,
+        "source": source_name(channel),
         "imageBase64": encoded_image,
         "imageContentType": content_type,
     }
@@ -178,74 +269,87 @@ async def send_to_backend(message, image_path: str, caption: str) -> bool:
 
     try:
         await asyncio.to_thread(request.urlopen, http_request, timeout=30)
-        logger.info("Sent Telegram post %s to backend", message.id)
+        logger.info("Sent @%s post %s to backend as %s", channel, message.id, post_id)
         return True
     except error.HTTPError as exc:
         if exc.code == 409:
-            logger.info("Telegram post %s already exists in backend", message.id)
+            logger.info("@%s post %s already exists in backend", channel, message.id)
             return False
-        logger.exception("Backend rejected post %s with HTTP %s", message.id, exc.code)
+        logger.exception("Backend rejected @%s post %s with HTTP %s", channel, message.id, exc.code)
     except Exception:
-        logger.exception("Failed sending Telegram post %s to backend", message.id)
+        logger.exception("Failed sending @%s post %s to backend", channel, message.id)
 
     return False
 
 
-async def process_message(message) -> None:
+async def process_message(message, channel: str) -> None:
     if not message.photo:
         return
-    if message.id in processed_post_ids:
+    post_key = (channel, message.id)
+    if post_key in processed_post_ids:
         return
 
-    processed_post_ids.add(message.id)
+    processed_post_ids.add(post_key)
     caption = clean_caption(message.raw_text or message.text or "")
     if not caption:
-        logger.info("Skipping Telegram post %s because it has no caption", message.id)
+        logger.info("Skipping @%s post %s because it has no caption", channel, message.id)
         return
     if not is_sports_related(caption):
-        logger.info("Skipping Telegram post %s because it is not sports-related", message.id)
+        logger.info("Skipping @%s post %s because it is not sports-related", channel, message.id)
         return
+
+    fingerprint = post_fingerprint(caption)
+    if fingerprint in seen_post_fingerprints:
+        logger.info("Skipping @%s post %s because matching content already exists", channel, message.id)
+        return
+    seen_post_fingerprints.add(fingerprint)
 
     try:
         DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
         image_path = await message.download_media(file=str(DOWNLOADS_DIR))
         if not image_path:
-            logger.warning("Telegram post %s has no downloadable image", message.id)
+            logger.warning("@%s post %s has no downloadable image", channel, message.id)
             return
 
-        logger.info("Downloaded post %s image: %s", message.id, image_path)
-        await send_to_backend(message, str(Path(image_path).resolve()), caption)
+        logger.info("Downloaded @%s post %s image: %s", channel, message.id, image_path)
+        await send_to_backend(message, channel, str(Path(image_path).resolve()), caption)
     except Exception:
-        logger.exception("Failed processing Telegram post %s", message.id)
+        logger.exception("Failed processing @%s post %s", channel, message.id)
 
 
-async def get_latest_posts() -> None:
+async def get_latest_posts(channel: str) -> None:
     logger.info(
-        "Fetching latest %s posts from @%s",
+        "Fetching latest %s posts from @%s (%s)",
         LATEST_POST_LIMIT,
-        CHANNEL_USERNAME,
+        channel,
+        source_name(channel),
     )
-    messages = await client.get_messages(CHANNEL_USERNAME, limit=LATEST_POST_LIMIT)
+    messages = await client.get_messages(channel, limit=LATEST_POST_LIMIT)
 
     for message in reversed(messages):
-        await process_message(message)
+        await process_message(message, channel)
 
 
-@client.on(events.NewMessage(chats=CHANNEL_USERNAME))
+@client.on(events.NewMessage(chats=CHANNEL_USERNAMES))
 async def new_post_handler(event) -> None:
-    logger.info("New Telegram post received: %s", event.message.id)
-    await process_message(event.message)
+    chat = await event.get_chat()
+    channel = clean_channel_name(getattr(chat, "username", "") or str(event.chat_id))
+    logger.info("New Telegram post received from @%s: %s", channel, event.message.id)
+    await process_message(event.message, channel)
 
 
 async def main() -> None:
     validate_config()
     if STRING_SESSION:
         logger.info("Using STRING_SESSION for Telegram authentication")
-    await get_latest_posts()
+    logger.info("Configured Telegram channels: %s", ", ".join(f"@{name}" for name in CHANNEL_USERNAMES))
+    await load_existing_fingerprints()
+    for channel in CHANNEL_USERNAMES:
+        await get_latest_posts(channel)
     if RUN_ONCE:
         logger.info("RUN_ONCE enabled; exiting after latest-post sync")
         return
-    logger.info("Listening for new posts from @%s", CHANNEL_USERNAME)
+    logger.info("Listening for new posts from %s", ", ".join(f"@{name}" for name in CHANNEL_USERNAMES))
 
 
 if __name__ == "__main__":

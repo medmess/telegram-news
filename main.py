@@ -10,6 +10,7 @@ from datetime import timezone
 from pathlib import Path
 from urllib import error, request
 
+from PIL import Image, ImageOps
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -53,6 +54,9 @@ STRING_SESSION = os.getenv("STRING_SESSION", "")
 SOURCE_NAME = os.getenv("SOURCE_NAME", "Offside")
 LATEST_POST_LIMIT = int(os.getenv("LATEST_POST_LIMIT", "15"))
 RUN_ONCE = os.getenv("RUN_ONCE", "false").lower() in {"1", "true", "yes"}
+COMPRESS_IMAGES = os.getenv("COMPRESS_IMAGES", "true").lower() in {"1", "true", "yes"}
+IMAGE_MAX_WIDTH = int(os.getenv("IMAGE_MAX_WIDTH", "1280"))
+IMAGE_QUALITY = int(os.getenv("IMAGE_QUALITY", "76"))
 
 logging.basicConfig(
     level=logging.INFO,
@@ -167,6 +171,10 @@ def validate_config() -> None:
         raise RuntimeError("LATEST_POST_LIMIT must be greater than 0.")
     if not CHANNEL_USERNAMES:
         raise RuntimeError("At least one Telegram channel is required.")
+    if IMAGE_MAX_WIDTH <= 0:
+        raise RuntimeError("IMAGE_MAX_WIDTH must be greater than 0.")
+    if not 1 <= IMAGE_QUALITY <= 95:
+        raise RuntimeError("IMAGE_QUALITY must be between 1 and 95.")
 
 
 def iso_date(message_date) -> str:
@@ -209,6 +217,58 @@ def image_payload(image_path: str) -> tuple[str | None, str | None]:
     content_type = mimetypes.guess_type(path.name)[0] or "image/jpeg"
     encoded = base64.b64encode(path.read_bytes()).decode("ascii")
     return encoded, content_type
+
+
+def compressed_image_path(image_path: str, channel: str, message_id: int) -> str:
+    if not COMPRESS_IMAGES:
+        return image_path
+
+    original_path = Path(image_path)
+    output_path = DOWNLOADS_DIR / "compressed" / f"{channel}_{message_id}.jpg"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        original_size = original_path.stat().st_size
+        with Image.open(original_path) as image:
+            image = ImageOps.exif_transpose(image)
+            if image.mode not in ("RGB", "L"):
+                image = image.convert("RGB")
+
+            if image.width > IMAGE_MAX_WIDTH:
+                ratio = IMAGE_MAX_WIDTH / image.width
+                new_height = max(1, int(image.height * ratio))
+                image = image.resize((IMAGE_MAX_WIDTH, new_height), Image.Resampling.LANCZOS)
+
+            image.save(
+                output_path,
+                format="JPEG",
+                quality=IMAGE_QUALITY,
+                optimize=True,
+                progressive=True,
+            )
+
+        compressed_size = output_path.stat().st_size
+        if compressed_size >= original_size:
+            logger.info(
+                "Keeping original image for @%s post %s because compression did not reduce size (%s >= %s)",
+                channel,
+                message_id,
+                compressed_size,
+                original_size,
+            )
+            return image_path
+
+        logger.info(
+            "Compressed @%s post %s image from %.1fKB to %.1fKB",
+            channel,
+            message_id,
+            original_size / 1024,
+            compressed_size / 1024,
+        )
+        return str(output_path.resolve())
+    except Exception:
+        logger.exception("Image compression failed for @%s post %s; using original", channel, message_id)
+        return image_path
 
 
 def backend_post_id(channel: str, message_id: int) -> int:
@@ -311,8 +371,10 @@ async def process_message(message, channel: str) -> None:
             logger.warning("@%s post %s has no downloadable image", channel, message.id)
             return
 
-        logger.info("Downloaded @%s post %s image: %s", channel, message.id, image_path)
-        await send_to_backend(message, channel, str(Path(image_path).resolve()), caption)
+        resolved_image_path = str(Path(image_path).resolve())
+        upload_image_path = compressed_image_path(resolved_image_path, channel, message.id)
+        logger.info("Downloaded @%s post %s image: %s", channel, message.id, resolved_image_path)
+        await send_to_backend(message, channel, upload_image_path, caption)
     except Exception:
         logger.exception("Failed processing @%s post %s", channel, message.id)
 

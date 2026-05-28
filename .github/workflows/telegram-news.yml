@@ -37,5 +37,8 @@ jobs:
           BACKEND_NEWS_ENDPOINT: ${{ secrets.BACKEND_NEWS_ENDPOINT }}
           SOURCE_NAME: Offside
           LATEST_POST_LIMIT: "15"
+          COMPRESS_IMAGES: "true"
+          IMAGE_MAX_WIDTH: "1280"
+          IMAGE_QUALITY: "76"
           RUN_ONCE: "true"
         run: python main.py

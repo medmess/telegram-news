@@ -40,10 +40,13 @@ load_env(ENV_PATH)
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "Offsideahdaff")
-ADDITIONAL_CHANNELS = os.getenv("ADDITIONAL_CHANNELS", "Erupean_sportt")
+ADDITIONAL_CHANNELS = os.getenv(
+    "ADDITIONAL_CHANNELS",
+    "Erupean_sportt,infosportz,infosportsplus",
+)
 CHANNEL_SOURCE_NAMES = os.getenv(
     "CHANNEL_SOURCE_NAMES",
-    "Offsideahdaff=Offside,Erupean_sportt=European Sport",
+    "Offsideahdaff=Offside,Erupean_sportt=European Sport,infosportz=Info Sportz,infosportsplus=Info Sports Plus",
 )
 BACKEND_NEWS_ENDPOINT = os.getenv(
     "BACKEND_NEWS_ENDPOINT",
